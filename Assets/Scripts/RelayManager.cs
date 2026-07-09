@@ -13,7 +13,13 @@ public class RelayManager : MonoBehaviour
 {
     private async void Start()
     {
-        await UnityServices.InitializeAsync();
+        // Services + auth live outside the scene, so a scene reload reruns
+        // this Start() while we're still initialized/signed in from before.
+        if (UnityServices.State == ServicesInitializationState.Uninitialized)
+            await UnityServices.InitializeAsync();
+
+        if (AuthenticationService.Instance.IsSignedIn)
+            return;
 
         AuthenticationService.Instance.SignedIn += () =>
         {
@@ -30,6 +36,9 @@ public class RelayManager : MonoBehaviour
 
             string joinCode = await RelayService.Instance.GetJoinCodeAsync(allocation.AllocationId);
             print("Lobby Code: " + joinCode);
+
+            // Auto-copy so the host can paste the code straight to friends.
+            GUIUtility.systemCopyBuffer = joinCode;
         
         
             NetworkManager.Singleton.GetComponent<UnityTransport>().SetHostRelayData(

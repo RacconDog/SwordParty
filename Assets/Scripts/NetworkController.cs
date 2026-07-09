@@ -1,49 +1,115 @@
-using UnityEngine;
 using Unity.Netcode;
+using Unity.Collections;
+using System.Collections.Generic;
 
-public class NetworkController : NetworkBehaviour
+// The network half of the input piping, built on Netcode's named messages so
+// it needs NO scene object and NO prefab — PlayerManager calls HostSession()
+// whenever a session starts (local or online) and everything self-wires.
+//
+// Pads on client machines register here and stream their input up; the
+// server creates a host-side InputPipe per (client, pad) and pushes into it,
+// so remote pads and couch pads are indistinguishable to the simulation.
+// Host-side pads never touch this — they push into their pipes directly.
+public static class NetworkController
 {
-    // Attached to the network player object on the host side.
-    // The owning client calls SendInputServerRpc each frame;
-    // the host applies it to the mounted Player.
+    private const string RegisterMsg = "SwordParty.RegisterPad";
+    private const string InputMsg = "SwordParty.PadInput";
 
-    private ControllerBase controller;
+    // Server-side lookup: one pipe + avatar per pad per connected machine.
+    private static readonly Dictionary<(ulong clientId, int padId), InputPipe> pipes
+        = new Dictionary<(ulong, int), InputPipe>();
+    private static readonly Dictionary<(ulong clientId, int padId), Player> avatars
+        = new Dictionary<(ulong, int), Player>();
 
-    public override void OnNetworkSpawn()
+    // ---------- server side ----------
+
+    // Call on every server start; handlers don't survive a session shutdown.
+    public static void HostSession()
     {
-        controller = GetComponent<ControllerBase>();
+        pipes.Clear();
+        avatars.Clear();
+
+        var messenger = NetworkManager.Singleton.CustomMessagingManager;
+        messenger.RegisterNamedMessageHandler(RegisterMsg, OnRegisterPad);
+        messenger.RegisterNamedMessageHandler(InputMsg, OnPadInput);
+
+        // -= before += so repeated sessions never double-subscribe.
+        NetworkManager.Singleton.OnClientDisconnectCallback -= HandleClientDisconnect;
+        NetworkManager.Singleton.OnClientDisconnectCallback += HandleClientDisconnect;
     }
 
-    void Update()
+    private static void OnRegisterPad(ulong senderClientId, FastBufferReader payload)
     {
-        if (!IsOwner) return;
+        payload.ReadValueSafe(out int padId);
 
-        // Owner reads local hardware and ships raw values to the host.
-        var input = GatherLocalInput();
-        SendInputServerRpc(input);
+        var key = (senderClientId, padId);
+        if (pipes.ContainsKey(key)) return;
+
+        var pipe = new InputPipe();
+        pipes[key] = pipe;
+        avatars[key] = PlayerManager.instance.HandlePlayerSpawn(pipe);
     }
 
-    private NetworkInputData GatherLocalInput()
+    private static void OnPadInput(ulong senderClientId, FastBufferReader payload)
     {
-        // If you want to reuse Unity's Input System here, inject a PlayerInput
-        // reference. For now this is a stub you can fill in per-project.
-        return new NetworkInputData();
-    }
+        payload.ReadValueSafe(out int padId);
+        payload.ReadNetworkSerializable(out NetworkInputData raw);
 
-    [ServerRpc]
-    private void SendInputServerRpc(NetworkInputData raw)
-    {
-        var data = new InputData
+        if (!pipes.TryGetValue((senderClientId, padId), out InputPipe pipe))
+            return;
+
+        pipe.PushInput(new InputData
         {
-            id = controller.playerID,
+            id = pipe.playerID,
             move = raw.move,
             look = raw.look,
             dash = raw.dash,
             attack = raw.attack,
             throwAttack = raw.throwAttack,
-        };
+        });
+    }
 
-        controller.PushInput(data);
+    private static void HandleClientDisconnect(ulong clientId)
+    {
+        // Tear down every pad this machine had joined. Despawning the avatar
+        // also despawns its sword (Player.OnNetworkDespawn).
+        var dead = new List<(ulong, int)>();
+        foreach (var key in pipes.Keys)
+            if (key.clientId == clientId)
+                dead.Add(key);
+
+        foreach (var key in dead)
+        {
+            if (avatars.TryGetValue(key, out Player avatar) && avatar &&
+                avatar.NetworkObject.IsSpawned)
+                avatar.NetworkObject.Despawn();
+
+            avatars.Remove(key);
+            pipes.Remove(key);
+        }
+    }
+
+    // ---------- client side ----------
+
+    public static void RegisterPad(int padId)
+    {
+        using var writer = new FastBufferWriter(sizeof(int), Allocator.Temp);
+        writer.WriteValueSafe(padId);
+
+        NetworkManager.Singleton.CustomMessagingManager.SendNamedMessage(
+            RegisterMsg, NetworkManager.ServerClientId, writer);
+    }
+
+    public static void SendInput(int padId, NetworkInputData data)
+    {
+        using var writer = new FastBufferWriter(64, Allocator.Temp);
+        writer.WriteValueSafe(padId);
+        writer.WriteNetworkSerializable(data);
+
+        // Unreliable-sequenced: stale input is worthless, next frame corrects.
+        NetworkManager.Singleton.CustomMessagingManager.SendNamedMessage(
+            InputMsg, NetworkManager.ServerClientId, writer,
+            NetworkDelivery.UnreliableSequenced);
     }
 }
 
